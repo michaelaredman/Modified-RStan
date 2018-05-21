@@ -1,0 +1,206 @@
+* Grab RStan repo with dependencies
+
+** Clone the RStan repo for the correct branch
+
+: git clone -b 'for-2.18' https://github.com/stan-dev/rstan.git
+
+** Check that we are in the correct branch
+
+: git branch
+
+This should give us '2.18'
+
+** Clone the submodules Stan and Stan-math
+
+Both Stan and Stan-Math are only linked in this branch so need to be cloned manually.
+
+*This will probably take a while!*
+
+: git submodule update --init
+: git submodule update 
+
+** Add our own branch to work on
+
+: git checkout -b 'degreesoffreedom'
+
+* Fixing build process
+
+** Modify install_StanHeaders.R
+
+In case we want to compile without making our modifications, we could have used devtools to clone the submodules and installed RStan.
+
+#+BEGIN_SRC R
+git2r::clone(file.path(stan_dev_root, "rstan"), path_rstan,
+             branch = "for-2.18")
+git2r::clone(file.path(stan_dev_root, "stan"),
+file.path(path_rstan, "StanHeaders", "inst", "include", "upstream"),
+             branch = "develop")
+git2r::clone(file.path(stan_dev_root, "math"),
+             file.path(path_rstan, "StanHeaders", "inst", "include", "mathlib"),
+             branch = "develop")
+#+END_SRC
+
+** Modify Makevars
+
+Add the C++14 flag to the file:
+: ./rstan/rstan/R_Makevars
+For example:
+: MAKEFLAGS=-j6 -std=c++14
+
+And add the same to +both+ of these:
+: ./StanHeaders/src/Makevars
+: ./rstan/rstan/src/Makevars
+- Using c++14 in =StanHeaders/src= seems to conflict with the ~-c~ flag on MacOS. The ~CPPFLAGS~ are being used in the compilation of =.c= files in =cvodes= for some reason. 
+
+
+* Modify mathlib files to add C++ functions
+
+** Create our new functions and add them to the right directory
+
+- We add to *rev* as we need only reverse mode autodifferentiation
+- The eigenvalues are passed as a vector so we add to *arr*
+
+First create the functions which calculate the inverse degrees of freedom and its derivative with respect to $\tau_\epsilon$ in the following file:
+: ./rstan/StanHeaders/inst/include/mathlib/stan/math/rev/arr/fun/degreesoffreedom.hpp
+#+BEGIN_SRC C++
+#include <vector>
+#include <utility>
+#include <numeric>
+#include <cmath>
+#include <boost/math/tools/roots.hpp>
+
+using std::vector;
+
+namespace edf_functions {
+
+    double effectiveDF(const double tau_b, const double tau_e, const vector<double>& vs) {
+      return std::accumulate(
+        vs.begin(),
+        vs.end(),
+        0.0,
+        [&](const double prev, const double v){ return prev + 1/(1 + tau_b*v/tau_e); }
+      );
+    }
+
+    double inverseEDF(const double U, const double tau_e, const vector<double>& vs) {
+      /// Returns the tau_b value for which the effective degrees of freedom is equal to U
+      double lower = 0;
+      double upper = 5;
+      int counter = 1;
+      while ((effectiveDF(upper, tau_e, vs) > U) && (counter++ < 30)) {
+        lower = upper;
+        upper = upper * 2.0;
+      }
+      if (counter == 30) throw;
+      // This could be improved by using Newton-Raphson
+      std::pair<double, double> result_pair = boost::math::tools::bisect(
+        [&](double tau_b){ return effectiveDF(tau_b, tau_e, vs) - U; },
+        lower,
+        upper,
+        [](double arg1, double arg2){ return std::abs(arg1 - arg2) < 0.001; } //tolerance
+      );
+      return (result_pair.first + result_pair.second)/2.0;
+    }
+
+    double d_inverseEDF(const double U, const double tau_e, const vector<double>& vs) {
+      return inverseEDF(U, tau_e, vs)/tau_e;
+    }
+
+}
+#+END_SRC
+
+Then add the functions which are templated for Stan:
+: ./rstan/StanHeaders/inst/include/mathlib/stan/math/rev/arr/fun/standf.hpp
+#+BEGIN_SRC C++
+#include <vector>
+#include "degreesoffreedom.hpp"
+#include <stan/math.hpp>
+
+namespace stan {
+	namespace math {
+
+		double inverseEDF(const double U, const double tau_e, const vector<double>& vs) {
+    		return edf_functions::inverseEDF(U, tau_e, vs);
+    	}
+    
+    	var inverseEDF(const double U, const var& tau_e, const vector<double>& vs) {
+    		double tau_e_value = tau_e.val();
+    		double invEDF = edf_functions::inverseEDF(U, tau_e_value, vs);
+    		double dinvEDF_dtau_e = edf_functions::d_inverseEDF(U, tau_e_value, vs);
+    		return var (new precomp_v_vari(invEDF, tau_e.vi_, dinvEDF_dtau_e));
+    	}
+
+    }
+}
+#+END_SRC
+ 
+** Modify the arr.hpp file to include our new function
+
+: ./rstan/StanHeaders/inst/include/mathlib/stan/math/rev/arr.hpp
+#+BEGIN_SRC C++
+#include <stan/math/rev/arr/fun/standf.hpp>
+#+END_SRC
+
+* Let the Stan package see the functions defined in Stan-Math
+
+** Append the signatures file with an add function
+
+Stan needs to find the correctly typed function from Stan-Math. The prototypes defined in the following file are included in ast.hpp which loads the main Stan header files:
+: ./rstan/StanHeaders/inst/include/upstream/src/stan/lang/function_signatures.h 
+
+- Use the ~add~ function which takes the function name as its first argument, the return value as the second, and the arguments of the function itself in subsequent arguments.
+- The wrapper function ~expr_type~ might not be *required* in this situation but it is good style to do so: [[https://github.com/stan-dev/stan/pull/2391]]
+- The ~vector_types[1]~ type corresponds to ~std::vector<T>~ -- this is simpler, although potentially slower, than using ~eigen::vector<T>~.
+#+BEGIN_SRC C++
+add("inverseEDF", expr_type(double_type()), expr_type(double_type()), expr_type(double_type()), expr_type(vector_types[1]));
+#+END_SRC
+
+* Compile StanHeaders
+
+** Symlink cvodes to the latest version
+
+: ln -sfn mathlib/lib/cvodes-3.1.0/ cvodes
+
+** Remove any temp files or caches
+
+- The install process will attempt to copy any files to the build folder. If a temp file that can't be copied is present the build will fail. Example of emacs file that silently killed the build:
+
+: cp: StanHeaders/inst/include/upstream/src/stan/lang/.#function_signatures.h: No such file or directory
+: cp: StanHeaders/inst/include/src/stan/lang/.#function_signatures.h: No such file or directory
+: ERROR
+: copying to build directory failed
+
+** Build the tarball
+
+In the root directory, run the command:
+: R CMD BUILD StanHeaders
+
+** Install 
+
+: R CMD INSTALL StanHeaders_2.18.0.tar.gz
+
+* Compile RStan
+
+** Install the tarball
+
+In the directory
+: ./rstan/rstan/
+running the make command
+: make build
+will build RStan without the vignettes or manual. This is *a lot* faster.
+
+To install the vignettes and manual aswell, instead run:
+: R CMD BUILD rstan
+
+** Install RStan
+
+: make install
+
+** Run tests
+
+This is slow but should probably be run at some point:
+: make test-R
+Also, unit tests should be written for all the additional functions. Both their Stan and Stan-Math implementations.
+
+
+
